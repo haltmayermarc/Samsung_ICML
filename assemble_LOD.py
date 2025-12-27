@@ -291,7 +291,6 @@ def create_dataset(num_input ,num_xy, refine, kappa_values):
             a_sample = np.array([a(p[0], p[1]) for p in pos])
             train_coeffs_a.append(a_sample)
 
-            # --- build LOD data ---
             A_LOD_matrix, f_LOD_vector = make_LOD_data(
                 num_xy, num_xy, refine, mesh_data, a
             )
@@ -375,7 +374,6 @@ def create_dataset(num_input ,num_xy, refine, kappa_values):
             a_sample = np.array([a(p[0], p[1]) for p in pos])
             validate_coeffs_a.append(a_sample)
 
-            # --- build LOD data ---
             A_LOD_matrix, f_LOD_vector = make_LOD_data(
                 num_xy, num_xy, refine, mesh_data, a
             )
@@ -404,7 +402,7 @@ epsi = 0.01
 kappa_values = np.array([epsi, 4.0, 8.0, 12.0, 16.0, 20.0])
 
 for idx, num in enumerate(list_num_xy):
-    ne, ng, p, edges, train_coeffs_a,  train_matrices, train_load_vectors, train_fenics_u, validate_coeffs_a, validate_matrices, validate_load_vectors, validate_fenics_u = create_dataset(num_input, num, refine, kappa_values)
+    ne, ng, p, edges, train_coeffs_a, train_matrices, train_load_vectors, train_fenics_u, validate_coeffs_a, validate_matrices, validate_load_vectors, validate_fenics_u = create_dataset(num_input, num, refine, kappa_values)
 
     # build filename
     base = f"data/P{order}_ne{ne}_{typ}_{num_input[0]}"
