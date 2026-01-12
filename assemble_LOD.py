@@ -63,8 +63,8 @@ def make_LOD_data_quantile(Nx, Ny, refine, grid, g, q_edges, kappa_values):
     fine_elems   = grid["fine_elems"]
     Nx_fine = grid["Nx_fine"]; Ny_fine = grid["Ny_fine"]
     
-    g_values = g.vector().get_local()
-    q_edges = np.quantile(g_values, np.linspace(0, 1, kappa_values.shape[0]+1))
+    # g_values = g.vector().get_local()
+    # q_edges = np.quantile(g_values, np.linspace(0, 1, kappa_values.shape[0]+1))
     
     def quantize_scalar(value, q_edges, kappa_values):
         # Return the kappa level corresponding to value
@@ -177,7 +177,33 @@ def make_LOD_data(Nx, Ny, refine, grid, g):
     
     return A_lod, f_lod
 
-def create_dataset(num_input ,num_xy, refine, kappa_values):
+
+class SEGaussianSamplerSVD:
+    
+    def __init__(self, pos, sigma=1.0, ell=0.3, mean=1.0, tol=1e-8):
+        self.pos = np.asarray(pos, dtype=float)
+        self.V = self.pos.shape[0]
+
+        # Pairwise distances
+        D = cdist(self.pos, self.pos)
+
+        # Covariance matrix for GRF
+        C = (sigma**2) * np.exp(-(D**2) / (2 * ell**2))
+
+        U, s, Vt = np.linalg.svd(C, full_matrices=False)
+
+        if np.min(s) < -tol:
+            raise ValueError(f"Covariance not PSD: min eigen/singular {np.min(s)} < -tol")
+        s = np.clip(s, 0.0, None)
+
+        self.A = U * np.sqrt(s)[None, :]
+        self.mean = mean
+
+    def sample(self, rng: np.random.Generator):
+        z = rng.normal(0.0, 1.0, size=(self.V,))
+        return self.mean + self.A @ z
+
+def create_dataset(num_input, num_xy, refine, kappa_values):
     mesh_data = build_uniform_grid(num_xy, num_xy, refine)
     
     coarse_nodes = mesh_data["coarse_nodes"]
@@ -202,12 +228,10 @@ def create_dataset(num_input ,num_xy, refine, kappa_values):
     # GRF parameters
     sigma = 1.0     # variance
     ell = 0.3       # correlation length
-
-    # Pairwise distances
-    D = cdist(pos, pos)
-
-    # Covariance matrix for GRF
-    C = sigma**2 * np.exp(-D**2/(2*ell**2))
+    
+    # Construct SE Kernel sampler for GRF
+    if TYPE == "quantile":
+        sampler = SEGaussianSamplerSVD(pos, sigma=sigma, ell=ell, mean=1.0, tol=1e-8)
 
     # Generate training and validation data
     train_coeffs_a = []
@@ -230,17 +254,22 @@ def create_dataset(num_input ,num_xy, refine, kappa_values):
     np.random.seed(5)
     for _ in tqdm(range(num_input[0])):
         if TYPE == "quantile":
-            a_sample = np.random.multivariate_normal(
-                mean=np.ones(V_dim),   # mean permeability = 1
-                cov=C
-            )
+            rng = np.random.default_rng()
+            a_sample = sampler.sample(rng)
             a_sample = np.exp(a_sample)
             a = Function(V)
             a.vector()[:] = a_sample
-            train_coeffs_a.append(a_sample)
             q_edges = np.quantile(a_sample, np.linspace(0, 1, kappa_values.shape[0]+1))
             
-            A_LOD_matrix, f_LOD_vector = make_LOD_data_quantile(num_xy, num_xy, refine, mesh_data, a, q_edges, kappa_values)
+            kappa_shuffled = np.asarray(kappa_values, dtype=float).copy()
+            rng.shuffle(kappa_shuffled)
+            
+            bins = np.searchsorted(q_edges[1:], a_sample, side="right")
+            bins = np.clip(bins, 0, len(kappa_values)-1)
+            kappa_node = kappa_shuffled[bins]
+            train_coeffs_a.append(kappa_node)
+
+            A_LOD_matrix, f_LOD_vector = make_LOD_data_quantile(num_xy, num_xy, refine, mesh_data, a, q_edges, kappa_shuffled)
             train_matrices.append(A_LOD_matrix)
             train_load_vectors.append(f_LOD_vector)
             try:
@@ -260,7 +289,7 @@ def create_dataset(num_input ,num_xy, refine, kappa_values):
                         K[j, i] = kappa_values[idx]
 
             # --- horizontal stripes ---
-            elif TYPE == "horizontal_stripes":
+            elif TYPE == "horizontal":
                 n_stripes = 16
                 stripe_vals = rng.choice(kappa_values, size=n_stripes)
 
@@ -269,7 +298,7 @@ def create_dataset(num_input ,num_xy, refine, kappa_values):
                     K[j, :] = stripe_vals[stripe_id]
 
             # --- vertical stripes ---
-            elif TYPE == "vertical_stripes":
+            elif TYPE == "vertical":
                 n_stripes = 16
                 stripe_vals = rng.choice(kappa_values, size=n_stripes)
 
@@ -307,23 +336,27 @@ def create_dataset(num_input ,num_xy, refine, kappa_values):
                     rcond=None
                 )[0]
             train_fenics_u.append(u_lod)
-
             
     # VALIDATION SET
     np.random.seed(10)
     for _ in tqdm(range(num_input[1])):
         if TYPE == "quantile":
-            a_sample = np.random.multivariate_normal(
-                mean=np.ones(V_dim),   # mean permeability = 1
-                cov=C
-            )
+            rng = np.random.default_rng()
+            a_sample = sampler.sample(rng)
             a_sample = np.exp(a_sample)
             a = Function(V)
             a.vector()[:] = a_sample
-            validate_coeffs_a.append(a_sample)
             q_edges = np.quantile(a_sample, np.linspace(0, 1, kappa_values.shape[0]+1))
             
-            A_LOD_matrix, f_LOD_vector = make_LOD_data_quantile(num_xy, num_xy, refine, mesh_data, a, q_edges, kappa_values)
+            kappa_shuffled = np.asarray(kappa_values, dtype=float).copy()
+            rng.shuffle(kappa_shuffled)
+
+            bins = np.searchsorted(q_edges[1:], a_sample, side="right")
+            bins = np.clip(bins, 0, len(kappa_values)-1)
+            kappa_node = kappa_shuffled[bins]
+            validate_coeffs_a.append(kappa_node)
+
+            A_LOD_matrix, f_LOD_vector = make_LOD_data_quantile(num_xy, num_xy, refine, mesh_data, a, q_edges, kappa_shuffled)
             validate_matrices.append(A_LOD_matrix)
             validate_load_vectors.append(f_LOD_vector)
             try:
@@ -394,8 +427,8 @@ def create_dataset(num_input ,num_xy, refine, kappa_values):
     return ne, ng, pos, edges, np.array(train_coeffs_a), np.array(train_matrices), np.array(train_load_vectors), np.array(train_fenics_u),  np.array(validate_coeffs_a), np.array(validate_matrices), np.array(validate_load_vectors), np.array(validate_fenics_u)
 
 order='1'
-list_num_xy=[16]
-num_input=[5000, 1000]
+list_num_xy=[63]
+num_input=[50, 10]
 typ='Darcy'
 refine = 2
 epsi = 0.01
