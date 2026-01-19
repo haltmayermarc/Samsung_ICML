@@ -312,7 +312,7 @@ def create_dataset(num_input, H, h, kappa_values):
             kappa_elem = compute_kappa_per_element(fine_elems, kappa_node)
             kappa = make_fast_kappa_uniform(h, int(1 / h), kappa_elem)
             
-            train_coeffs_a.append(kappa_node)
+            validate_coeffs_a.append(kappa_node)
 
             A_LOD_matrix, f_LOD_vector = make_LOD_data(
                 mesh_data, adjacency, fine_in_coarse,
