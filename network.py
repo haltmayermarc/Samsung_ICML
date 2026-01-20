@@ -273,7 +273,7 @@ class DarcyMessagePassing(MessagePassing):
     def __init__(self, in_channels, out_channels):
         super().__init__(aggr='add')  # sum aggregation
         self.mlp = nn.Sequential(
-            nn.Linear(in_channels * 2 + 1, 64),
+            nn.Linear(in_channels * 2 + 7, 64),
             nn.ReLU(),
             nn.Linear(64, out_channels)
         )
@@ -310,3 +310,102 @@ class SimpleDarcyGNN(nn.Module):
             x = F.relu(x)
 
         return self.out_mlp(x)
+    
+class NewDarcyMessagePassing(MessagePassing):
+    def __init__(self, node_dim, edge_dim):
+        super().__init__(aggr="add")
+
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(edge_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Softplus()  # ensures positivity
+        )
+
+    def forward(self, x, edge_index, edge_attr):
+        return self.propagate(edge_index, x=x, edge_attr=edge_attr)
+
+    def message(self, x_i, x_j, edge_attr):
+        k_ij = self.edge_mlp(edge_attr)        # (E, 1)
+        return k_ij * (x_j - x_i)
+
+class DarcyGNN(nn.Module):
+    def __init__(self, hidden_dim, num_layers, edge_dim):
+        super().__init__()
+
+        self.embed = nn.Linear(1, hidden_dim)
+
+        self.layers = nn.ModuleList([
+            NewDarcyMessagePassing(hidden_dim, edge_dim)
+            for _ in range(num_layers)
+        ])
+
+        self.out = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, data):
+        x = self.embed(data.x)
+
+        for layer in self.layers:
+            x = layer(x, data.edge_index, data.edge_attr) #+x
+
+        return self.out(x)
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class UNetEncoder(nn.Module):
+    def __init__(self, in_channels=1, base_channels=32):
+        super().__init__()
+
+        self.enc1 = ConvBlock(in_channels, base_channels)
+        self.enc2 = ConvBlock(base_channels, base_channels * 2)
+        self.enc3 = ConvBlock(base_channels * 2, base_channels * 4)
+        self.enc4 = ConvBlock(base_channels * 4, base_channels * 8)
+
+        self.pool = nn.MaxPool2d(2)
+
+    def forward(self, x):
+        x = self.enc1(x)
+        x = self.pool(x)
+        x = self.enc2(x)
+        x = self.pool(x)
+        x = self.enc3(x)
+        x = self.pool(x)
+        x = self.enc4(x)
+        return x
+    
+class UNetLatentModel(nn.Module):
+    def __init__(self, latent_dim=256, out_dim=49):
+        super().__init__()
+
+        self.encoder = UNetEncoder()
+
+        self.pool = nn.AdaptiveAvgPool2d(1)  # global pooling
+
+        self.mlp = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, out_dim)
+        )
+
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.pool(x).flatten(1)  # (B, latent_dim)
+        return self.mlp(x)
