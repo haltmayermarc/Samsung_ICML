@@ -331,7 +331,6 @@ def init_optim_adagrad(model, lr=1e-2, weight_decay=0):
     }
     return torch.optim.Adagrad(model.parameters(), **params)
 
-"""
 if gparams['optimizer'] == "LBFGS":
     optimizer = init_optim_lbfgs(model_FEONet)
 elif gparams['optimizer'] == "Adam":
@@ -342,12 +341,6 @@ elif gparams['optimizer'] == "AdamW":
     optimizer = init_optim_adamw(model_FEONet)
 elif gparams['optimizer'] == "Adagrad":
     optimizer = init_optim_adagrad(model_FEONet)
-"""
-
-optimizer = init_optim_adam(model_FEONet, lr=1e-3)
-lbfgs_optimizer = init_optim_lbfgs(model_FEONet)
-
-switch_epoch = 1000
 
 
 def rel_L2_error(u_pred, u_true):
@@ -463,13 +456,10 @@ for epoch in range(1, epochs + 1):
     model_FEONet.train()
     epoch_loss = 0.0
 
-    if epoch >= switch_epoch:
-        optimizer = lbfgs_optimizer
-
     for batch in train_loader:
         batch = batch.to(device)
 
-        if optimizer is lbfgs_optimizer:
+        if gparams["optimizer"] is "LBFGS":
             # LBFGS closure
             def lbfgs_closure():
                 optimizer.zero_grad()
@@ -510,7 +500,6 @@ for epoch in range(1, epochs + 1):
 
         log_str = (
             f"[Epoch {epoch:04d}] "
-            f"Phase={'MSE' if epoch <= switch_epoch else 'WEAK'}   "
             f"Loss={epoch_loss:.6f}   "
             f"Test_relL2={rel_err:.6f}"
         )
@@ -523,7 +512,6 @@ for epoch in range(1, epochs + 1):
 checkpoint = {
     "model_state_dict": model_FEONet.state_dict(),
     "args": gparams,
-    "final_phase": "weak_form" if epochs > switch_epoch else "mse",
 }
 
 save_path = os.path.join(path, f"{gparams['model']}_MSE_to_WEAK.pt")
