@@ -19,6 +19,9 @@ from torch_geometric.data import InMemoryDataset, Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.utils import add_self_loops
 
+def int_list(arg):
+    return [int(x) for x in arg.split(",")]
+
 
 # ARGS
 parser = argparse.ArgumentParser("SEM")
@@ -31,13 +34,24 @@ parser.add_argument("--num_training_data", type=int, default=5000)
 parser.add_argument("--hidden_dims", type=int, default=32)
 parser.add_argument("--out_dims", type=int, default=16)
 parser.add_argument("--num_layers", type=int, default=4)
-parser.add_argument("--model", type=str, default='SimpleDarcyGNN', choices=['SimpleDarcyGNN', "DarcyGNN"])
+parser.add_argument("--model", type=str, default='SimpleDarcyGNN', choices=['SimpleDarcyGNN', "DarcyGNN", 'GraphtoVec'])
 parser.add_argument("--optimizer", type=str, default="Adam")
 parser.add_argument("--train_batch_size", type=int, default=64)
 parser.add_argument("--validate_batch_size", type=int, default=32)
 parser.add_argument("--loss", type=str, choices=['mse', 'rel_l2', 'weak_form'], default='mse')
 parser.add_argument("--epochs", type=int, default=50000)
 parser.add_argument("--gpu", type=int, default=0)
+parser.add_argument(
+    "--conv_dims",
+    type=int_list,
+    default=[0],
+)
+parser.add_argument(
+    "--mlp_dims",
+    type=int_list,
+    default=[0],
+)
+
 
 args = parser.parse_args()
 gparams = args.__dict__
@@ -56,7 +70,10 @@ num_training_data = gparams['num_training_data']
 base = f"data/P{basis_order}_ne0.125_Darcy_{num_training_data}"
 
 if gparams["type"] is not None:
-    npz_path = f"{base}_{type}_FIXED.npz"
+    if gparams["model"] != "GraphtoVec":
+        npz_path = f"{base}_{type}_FIXED.npz"
+    else:
+        npz_path = f"{base}_{type}_FINE.npz"
 else:
     npz_path = f"{base}.npz"
 
@@ -68,6 +85,7 @@ p = mesh["coarse_nodes"]
 models = {
           'SimpleDarcyGNN': SimpleDarcyGNN,
           'DarcyGNN': DarcyGNN,
+          'GraphtoVec': GraphToVectorGNN
           }
 
 MODEL = models[gparams['model']]
@@ -82,6 +100,10 @@ if gparams["model"] == "SimpleDarcyGNN":
     model_FEONet = MODEL(hidden_dim=hidden_dims, out_dim=out_dims, num_layers=num_layers)
 elif gparams["model"] == "DarcyGNN":
     model_FEONet = MODEL(hidden_dim=hidden_dims, num_layers=num_layers, edge_dim=6)
+elif gparams["model"] == "GraphtoVec":
+    conv_dims = [3] + gparams['conv_dims']
+    mlp_dims = gparams['mlp_dims'] + [49]
+    model_FEONet = MODEL(conv_dims=conv_dims, mlp_dims=mlp_dims, dropout=0.1)
     
 device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
 model_FEONet = model_FEONet.to(device)
@@ -95,6 +117,10 @@ def weights_init(m):
         torch.nn.init.zeros_(m.bias)
 
 model_FEONet.apply(weights_init)
+
+##################################################################################
+### Dataset class definition
+##################################################################################
 
 class DarcyGraphDataset(InMemoryDataset):
     def __init__(self, root, npz_path, kind="train",
@@ -180,19 +206,90 @@ class DarcyGraphDataset(InMemoryDataset):
         # Save
         self.save(data_list, self.processed_paths[0])
         
-print(npz_path)
+# Dataset class for GraphtoVec
+class NewDarcyGraphDataset(InMemoryDataset):
+    def __init__(
+        self,
+        root,
+        npz_path,
+        kind="train",   # "train" or "validate"
+        transform=None,
+        pre_transform=None,
+    ):
+        self.npz_path = npz_path
+        self.kind = kind
 
-train_dataset = DarcyGraphDataset(
-    root="data/",
-    npz_path=npz_path,
-    kind="train"
-)
+        super().__init__(root, transform, pre_transform)
+        self.load(self.processed_paths[0])
 
-val_dataset = DarcyGraphDataset(
-    root="data/",
-    npz_path=npz_path,
-    kind="validate"
-)
+    @property
+    def raw_file_names(self):
+        return [os.path.basename(self.npz_path)]
+
+    @property
+    def processed_file_names(self):
+        return [f"{self.kind}.pt"]
+
+    def download(self):
+        pass
+
+    def process(self):
+        arr = np.load(self.npz_path, allow_pickle=True)
+
+        # -------------------------------------------------
+        # Shared graph structure
+        # -------------------------------------------------
+        edge_index = torch.tensor(arr["edges"], dtype=torch.long)  
+        fine_nodes = torch.tensor(arr["fine_nodes"], dtype=torch.float)
+
+        # -------------------------------------------------
+        # Split-specific data
+        # -------------------------------------------------
+        a_all = arr[f"{self.kind}_coeffs_a"]
+        u_all = arr[f"{self.kind}_u"]
+        A_all = arr[f"{self.kind}_matrices"]
+        f_all = arr[f"{self.kind}_load_vectors"]
+
+        Ns = a_all.shape[0]
+        data_list = []
+
+        for k in range(Ns):
+            # -------------------------------------------------
+            # Node features
+            # x_i = [a_i, x_i, y_i]
+            # -------------------------------------------------
+            a = torch.tensor(a_all[k], dtype=torch.float).unsqueeze(-1)  # (Nf, 1)
+            x = torch.cat([a, fine_nodes], dim=1)                        # (Nf, 3)
+
+            # -------------------------------------------------
+            # Graph-level quantities (IMPORTANT: add batch dim)
+            # -------------------------------------------------
+            y = torch.tensor(u_all[k], dtype=torch.float).unsqueeze(0)   # (1, 49)
+            A = torch.tensor(A_all[k], dtype=torch.float).unsqueeze(0)   # (1, 49, 49)
+            f = torch.tensor(f_all[k], dtype=torch.float).unsqueeze(0)   # (1, 49)
+
+            data = Data(
+                x=x,                      # node features
+                edge_index=edge_index,    # shared connectivity
+                y=y,                      # graph-level target
+                A=A,                      # graph-level operator
+                f=f,                      # graph-level RHS
+                pos=fine_nodes,           
+            )
+
+            data_list.append(data)
+
+        self.save(data_list, self.processed_paths[0])
+
+
+
+if gparams["model"] != "GraphtoVec":
+    train_dataset = DarcyGraphDataset(root="data/",npz_path=npz_path,kind="train")
+    val_dataset = DarcyGraphDataset(root="data/",npz_path=npz_path,kind="validate")
+else:
+    train_dataset = NewDarcyGraphDataset(root="data/",npz_path=npz_path,kind="train")
+    val_dataset = NewDarcyGraphDataset(root="data/",npz_path=npz_path,kind="validate")
+
 
 if optimizer == "LBFGS":
     train_loader = DataLoader(train_dataset, batch_size=len(train_dataset), shuffle=True)
@@ -250,13 +347,18 @@ elif gparams['optimizer'] == "Adagrad":
 optimizer = init_optim_adam(model_FEONet, lr=1e-3)
 lbfgs_optimizer = init_optim_lbfgs(model_FEONet)
 
-switch_epoch = 10000
+switch_epoch = 1000
 
 
 def rel_L2_error(u_pred, u_true):
     return torch.norm(u_pred - u_true) / torch.norm(u_true)
 
+def rel_l2_loss(u_pred, u_true, eps=1e-8):
+    diff = torch.norm(u_pred - u_true, dim=1)
+    denom = torch.norm(u_true, dim=1) + eps
+    return torch.mean(diff / denom)
 
+"""
 def compute_loss(u_pred, batch, loss_type="rel_l2"):
     ptr = batch.ptr
     batch_size = ptr.numel() - 1
@@ -287,11 +389,43 @@ def compute_loss(u_pred, batch, loss_type="rel_l2"):
         )
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
+"""
+    
+def compute_loss(u_pred, batch, loss_type="mse", eps=1e-8):
+    """
+    u_pred : (B, Nc)
+    batch.y : (B, Nc)
+    batch.A : (B, Nc, Nc)
+    batch.f : (B, Nc)
+    """
+
+    u_true = batch.y
+
+    if loss_type == "mse":
+        # Mean squared error over batch and DOFs
+        return torch.mean((u_pred - u_true) ** 2)
+
+    elif loss_type == "rel_l2":
+        # Relative L2 error per sample, then averaged
+        diff = u_pred - u_true
+        num = torch.norm(diff, dim=1)
+        denom = torch.norm(u_true, dim=1) + eps
+        return torch.mean(num / denom)
+
+    elif loss_type == "weak_form":
+        # Residual: A u - f
+        r = torch.bmm(batch.A, u_pred.unsqueeze(-1)).squeeze(-1) - batch.f
+        return torch.mean(torch.norm(r, dim=1))
+
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}")
+
 
 def closure(model, batch, loss_type="mse"):
     u_pred = model(batch)
     loss = compute_loss(u_pred, batch, loss_type)
     return loss, u_pred
+
 
 path = os.path.join(os.getcwd(), 'model', type, gparams["model"])
 if not os.path.exists(path):
@@ -331,7 +465,6 @@ for epoch in range(1, epochs + 1):
 
     if epoch >= switch_epoch:
         optimizer = lbfgs_optimizer
-        loss_type = "weak_form"
 
     for batch in train_loader:
         batch = batch.to(device)
@@ -358,7 +491,7 @@ for epoch in range(1, epochs + 1):
     # =======================
     # Validation
     # =======================
-    if epoch % 10 == 0:
+    if epoch % 2 == 0:
         model_FEONet.eval()
         rel_err_total = 0.0
         count = 0

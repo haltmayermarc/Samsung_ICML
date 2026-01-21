@@ -1,30 +1,20 @@
 import numpy as np
-import pandas as pd
-import scipy
 from scipy import io
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 from tqdm import tqdm
-import time
-from datetime import datetime
-import os
-import random
-import sys
 import argparse
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 from dolfin import *
 from mshr import *
 from scipy.spatial.distance import cdist
+from scipy.spatial.distance import cdist
+from scipy.special import kv, gamma
+from scipy.interpolate import LinearNDInterpolator
 from LOD import *
 
 parser = argparse.ArgumentParser("SEM")
-parser.add_argument("--type", type=str, choices=['quantile', 'coarse_checkerboard', 'fine_checkerboard', 'horizontal', 'vertical'])
+parser.add_argument("--type", type=str, choices=['quantile', 'lognormal', 'coarse_checkerboard', 'fine_checkerboard', 'horizontal', 'vertical'])
 parser.add_argument("--H", type=int, default=3)
 parser.add_argument("--h", type=int, default=7)
-parser.add_argument("--k", type=int, default=3)
+parser.add_argument("--k", type=int, default=5)
 args = parser.parse_args()
 gparams = args.__dict__
 
@@ -44,7 +34,7 @@ class SEGaussianSamplerSVD:
         # Covariance matrix for GRF
         C = (sigma**2) * np.exp(-(D**2) / (2 * ell**2))
 
-        U, s, Vt = np.linalg.svd(C, full_matrices=False)
+        U, s, _ = np.linalg.svd(C, full_matrices=False)
 
         if np.min(s) < -tol:
             raise ValueError(f"Covariance not PSD: min eigen/singular {np.min(s)} < -tol")
@@ -56,7 +46,53 @@ class SEGaussianSamplerSVD:
     def sample(self, rng: np.random.Generator):
         z = rng.normal(0.0, 1.0, size=(self.V,))
         return self.mean + self.A @ z
+    
+def matern_covariance(X, sigma=1.0, nu=1.0, kappa=0.3):
+    r = cdist(X, X)
+    r[r == 0.0] = 1e-12
 
+    factor = (sigma**2) / (2**(nu - 1) * gamma(nu))
+    arg = np.sqrt(2 * nu) * r / kappa
+
+    C = factor * (arg**nu) * kv(nu, arg)
+    np.fill_diagonal(C, sigma**2)
+    return C
+
+class MaternGaussianField:
+    def __init__(self, points, sigma=1.0, nu=1.0, kappa=0.3, mean=0.0, tol=1e-10):
+        self.points = np.asarray(points, dtype=float)
+        self.N = self.points.shape[0]
+        self.mean = mean
+
+        C = matern_covariance(self.points, sigma, nu, kappa)
+
+        eigvals, eigvecs = np.linalg.eigh(C)
+        eigvals = np.clip(eigvals, tol, None)
+
+        self.A = eigvecs @ np.diag(np.sqrt(eigvals))
+
+    def sample(self, rng=np.random.default_rng()):
+        z = rng.normal(size=self.N)
+        return self.mean + self.A @ z
+
+def make_lognormal_kappa(
+    points,                 # (N, 2)
+    field,
+    rng,
+):
+    Z = field.sample(rng)
+    A = np.exp(Z)   # lognormal field
+
+    # Scattered interpolator
+    interpolator = LinearNDInterpolator(points, A)
+
+    def kappa_func(x, y):
+        x = np.atleast_1d(x)
+        y = np.atleast_1d(y)
+        pts = np.column_stack([x, y])
+        return interpolator(pts)
+
+    return kappa_func, A
 
 # For quantile-type coefficient
 def compute_kappa_per_element(coarse_elems, kappa_node):
@@ -152,6 +188,14 @@ def create_dataset(num_input, H, h, kappa_values):
     # Construct SE Kernel sampler for GRF
     if TYPE == "quantile":
         sampler = SEGaussianSamplerSVD(pos, sigma=sigma, ell=ell, mean=1.0, tol=1e-8)
+    elif TYPE == "lognormal":
+        field = MaternGaussianField(
+                fine_nodes,
+                sigma=1.0,
+                nu=0.5,
+                kappa=0.1,
+                mean=0.0,
+            )
     
     ###########################################################
     # Generate all data that do not depend 
@@ -204,6 +248,32 @@ def create_dataset(num_input, H, h, kappa_values):
             
             kappa_elem = compute_kappa_per_element(fine_elems, kappa_node)
             kappa = make_fast_kappa_uniform(h, int(1 / h), kappa_elem)
+            
+            train_coeffs_a.append(kappa_node)
+    
+            A_LOD_matrix, f_LOD_vector = make_LOD_data(
+                    mesh_data, adjacency, fine_in_coarse,
+                    kappa, 
+                    B_H, C_h, f_h, P_h
+            )
+
+            train_matrices.append(A_LOD_matrix)
+            train_load_vectors.append(f_LOD_vector)
+
+            try:
+                u_lod = np.linalg.solve(A_LOD_matrix, f_LOD_vector)
+            except np.linalg.LinAlgError:
+                u_lod = np.linalg.lstsq(A_LOD_matrix + 1e-12*np.eye(A_LOD_matrix.shape[0]), f_LOD_vector, rcond=None)[0]
+            train_fenics_u.append(u_lod)
+            
+        if TYPE == "lognormal":
+            rng = np.random.default_rng()
+            
+            kappa, kappa_node = make_lognormal_kappa(
+                fine_nodes,
+                field,
+                rng
+            )
             
             train_coeffs_a.append(kappa_node)
     
@@ -328,6 +398,32 @@ def create_dataset(num_input, H, h, kappa_values):
                 u_lod = np.linalg.lstsq(A_LOD_matrix + 1e-12*np.eye(A_LOD_matrix.shape[0]), f_LOD_vector, rcond=None)[0]
             validate_fenics_u.append(u_lod)
             
+        if TYPE == "lognormal":
+            rng = np.random.default_rng()
+            
+            kappa, kappa_node = make_lognormal_kappa(
+                fine_nodes,
+                field,
+                rng
+            )
+            
+            train_coeffs_a.append(kappa_node)
+    
+            A_LOD_matrix, f_LOD_vector = make_LOD_data(
+                    mesh_data, adjacency, fine_in_coarse,
+                    kappa, 
+                    B_H, C_h, f_h, P_h
+            )
+
+            train_matrices.append(A_LOD_matrix)
+            train_load_vectors.append(f_LOD_vector)
+
+            try:
+                u_lod = np.linalg.solve(A_LOD_matrix, f_LOD_vector)
+            except np.linalg.LinAlgError:
+                u_lod = np.linalg.lstsq(A_LOD_matrix + 1e-12*np.eye(A_LOD_matrix.shape[0]), f_LOD_vector, rcond=None)[0]
+            train_fenics_u.append(u_lod)
+            
         elif TYPE in ["coarse_checkerboard", "fine_checkerboard", "horizontal", "vertical"]:
             rng = np.random.default_rng()
             
@@ -414,8 +510,8 @@ def create_dataset(num_input, H, h, kappa_values):
 
 
 order='1'
-list_num_xy=[63]
-num_input=[3, 1]
+list_num_xy=[128]
+num_input=[5000, 500]
 typ='Darcy'
 
 epsi = 0.01
