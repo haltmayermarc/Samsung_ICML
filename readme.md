@@ -2,7 +2,6 @@
 
 ### Step1 - Create Training Set.
 Using the 'assemble_LOD.py' code, you can genrate the training samples. For the coefficient type "--type" you can choose between 'quantile','checkerboard', 'horizontal' and 'vertical'.
-IMPORTANT: RIGHT NOW WORKS ONLY FOR QUANTILE!!!
 ```
 python3 assemble_LOD.py --type quantile
 ```
