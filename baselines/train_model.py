@@ -66,20 +66,20 @@ class DarcyFVMNPZ(Dataset):
       validate_coeffs_a: (N,s,s)
       validate_u:        (N,s,s)
     """
-    def __init__(self, npz_path: str, split: str):
+    def __init__(self, npz_path: str, split: str, s: int):
         arr = np.load(npz_path, allow_pickle=True)
         assert split in ["train", "validate"]
 
         if split == "train":
-            a = arr["train_coeffs_a"].astype(np.float32)
-            u = arr["train_u"].astype(np.float32)
+            a = arr["train_coeffs_a"].astype(np.float32).reshape(-1, s, s)
+            u = arr["train_u"].astype(np.float32).reshape(-1, s, s)
         else:
-            a = arr["validate_coeffs_a"].astype(np.float32)
-            u = arr["validate_u"].astype(np.float32)
+            a = arr["validate_coeffs_a"].astype(np.float32).reshape(-1, s, s)
+            u = arr["validate_u"].astype(np.float32).reshape(-1, s, s)
 
         self.a = a
         self.u = u
-        self.s = a.shape[-1]
+        self.s = s
 
     def __len__(self):
         return self.a.shape[0]
@@ -283,6 +283,7 @@ def infer_io_format(model: nn.Module, s: int, device: torch.device):
 @torch.no_grad()
 def save_viz(
     epoch: int,
+    s: int,
     model_forward,
     model,
     npz_path: str,
@@ -294,8 +295,8 @@ def save_viz(
     use_mollifier: bool=False,
 ):
     arr = np.load(npz_path, allow_pickle=True)
-    a_all = arr["validate_coeffs_a"].astype(np.float32)
-    u_all = arr["validate_u"].astype(np.float32)
+    a_all = arr["validate_coeffs_a"].astype(np.float32).reshape(-1, s, s)
+    u_all = arr["validate_u"].astype(np.float32).reshape(-1, s, s)
 
     model.eval()
     n = len(indices)
@@ -383,12 +384,11 @@ def evaluate(model_forward, model, val_loader, device, a_pre, mollifier, use_mol
 def main():
     parser = argparse.ArgumentParser("Train Darcy with (optional) PINO hard-BC")
     parser.add_argument("--atype", type=str, choices=['quantile', 'checkerboard', 'horizontal', 'vertical'], default='quantile')
-    parser.add_argument('--s', type=int, default=64)
+    parser.add_argument('--s', type=int, default=65)
     parser.add_argument("--model", type=str, choices=["fno", "cno", "uno", 'mg_tfno', 'deeponet', 'transolver'], default="fno")
     parser.add_argument("--loss", type=str, choices=["mse", "rel_l2", "PI"], default="mse")
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--train_batch_size", type=int, default=32)
-    parser.add_argument("--pde_batch_size", type=int, default=None)   # None이면 train_batch_size
     parser.add_argument("--validate_batch_size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--gpu", type=int, default=0)
@@ -399,9 +399,9 @@ def main():
     set_seed(args.seed)
 
     # data
-    data_npz = f'./data/FVM_s{args.s}_Darcy_5000_{args.atype}.npz'
-    train_set = DarcyFVMNPZ(data_npz, split="train")
-    val_set   = DarcyFVMNPZ(data_npz, split="validate")
+    data_npz = f'./data/P1_nolod_ne{args.s-1}_Darcy_5000_{args.atype}.npz'
+    train_set = DarcyFVMNPZ(data_npz, split="train", s=args.s)
+    val_set   = DarcyFVMNPZ(data_npz, split="validate", s=args.s)
 
     train_loader = DataLoader(train_set, batch_size=args.train_batch_size, shuffle=True, num_workers=4)
     val_loader   = DataLoader(val_set, batch_size=args.validate_batch_size, shuffle=False, num_workers=4)
@@ -416,21 +416,24 @@ def main():
     else:
         a_pre = APreprocess("none", 0.0, 1.0, device)
 
-
-    # pde loader (for PI)
-    pde_bs = args.train_batch_size if args.pde_batch_size is None else args.pde_batch_size
-    pde_loader = DataLoader(train_set, batch_size=pde_bs, shuffle=True, num_workers=4)
-    pde_iter = cycle(pde_loader)
-
     # model
     s = train_set.s
     model = build_model(args.model, s=s).to(device)
     nparams = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    model_forward = infer_io_format(model, s, device)
+    if args.model == "mg_tfno":
+        def model_forward(a_batch):
+            x = a_batch.permute(0, 3, 1, 2)
+            x_s1 = F.interpolate(x, size=(s-1, s-1), mode="bilinear", align_corners=False)
+            y_s1 = model(x_s1)  # (B, 1, s-1, s-1)
+            y = F.interpolate(y_s1, size=(s, s), mode="bilinear", align_corners=False)
+            return y[:, 0, :, :]  # -> (B, s, s)
+    else:
+        model_forward = infer_io_format(model, s, device)
 
-    # hard BC only for PINO [Not in use now]
-    use_mollifier = True if args.loss == "PI" else False
+    # hard BC
+    # use_mollifier = True if args.loss == "PI" else False
+    use_mollifier = True
     mollifier = make_mollifier(s, device) if use_mollifier else None
 
     model.eval()
@@ -442,10 +445,12 @@ def main():
     print("Val error before training:", val0)
 
     # optimizer
-    lr = 1e-3 if args.model in ["fno", "cno", "uno", "mg_tfno"] else 3e-4
+    lr = 1e-3
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     warmup_epochs = 50
     lambda_pde = 1e-1
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # logging dirs
     log_dir = os.path.join(os.getcwd(), "log", args.model)
@@ -511,15 +516,7 @@ def main():
 
             # PDE loss
             if args.loss in ["PI"] and epoch >= warmup_epochs:
-                a_pde_raw, _ = next(pde_iter)
-                a_pde_raw = a_pde_raw.to(device)
-                a_pde_in = a_pre(a_pde_raw)
-
-                pred_pde = model_forward(a_pde_in)
-                if use_mollifier:
-                    pred_pde = pred_pde * mollifier
-
-                pde_loss = darcy_pde_loss_fvm(pred_pde, a_pde_raw[..., 0], f_value=1.0)
+                pde_loss = darcy_pde_loss_fvm(pred, a_raw[..., 0], f_value=1.0)
             else:
                 pde_loss = torch.zeros((), device=device)
 
@@ -565,8 +562,10 @@ def main():
                 }, best_ckpt)
 
             save_path = os.path.join(fig_dir, f"epoch_{epoch:05d}.png")
-            save_viz(epoch, model_forward, model, data_npz, save_path, viz_ids, device,
+            save_viz(epoch, s, model_forward, model, data_npz, save_path, viz_ids, device,
                      a_pre=a_pre, mollifier=mollifier, use_mollifier=use_mollifier)
+        
+        scheduler.step()
 
     log_str = f"\nTraining finished in {time.time() - start_time:.2f} seconds. Best Val_RelL2 = {best_val:.6f}"
     with open(log_file, "a", encoding="utf-8") as f:
