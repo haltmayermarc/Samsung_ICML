@@ -11,8 +11,6 @@ from tqdm import tqdm
 from pprint import pprint
 import matplotlib.pyplot as plt
 from network import *
-from dolfin import *
-from mshr import *
 import torch.nn.utils as utils
 from torch_geometric.data import InMemoryDataset, Data, DataLoader
 from torch_geometric.data import InMemoryDataset, Data
@@ -38,10 +36,10 @@ parser.add_argument("--model", type=str, default='SimpleDarcyGNN', choices=['Sim
 parser.add_argument("--optimizer", type=str, default="Adam")
 parser.add_argument("--train_batch_size", type=int, default=64)
 parser.add_argument("--validate_batch_size", type=int, default=32)
-parser.add_argument("--loss", type=str, choices=['mse', 'rel_l2', 'weak_form'], default='mse')
+parser.add_argument("--loss", type=str, choices=['mse', 'rel_l2', 'weak_form', 'total'], default='mse')
 parser.add_argument("--epochs", type=int, default=50000)
 parser.add_argument("--gpu", type=int, default=0)
-""" # Doesn't work
+"""
 parser.add_argument(
     "--conv_dims",
     type=int_list,
@@ -72,14 +70,16 @@ base = f"data/P{basis_order}_ne0.125_Darcy_{num_training_data}"
 
 if gparams["type"] is not None:
     if gparams["model"] != "GraphtoVec":
-        npz_path = f"{base}_{type}_FIXED.npz"
+        npz_path = f"{base}_{type}_withQ_FIXED.npz"
     else:
-        npz_path = f"{base}_{type}_FINE.npz"
+        npz_path = f"{base}_{type}_withQ_FIXED.npz"
 else:
     npz_path = f"{base}.npz"
 
 # Load mesh data
 mesh = np.load(npz_path, allow_pickle=True)
+P_h = mesh["P_h"]
+print("P_h.shape: ", P_h.shape)
 p = mesh["coarse_nodes"]
 
 #Model
@@ -103,11 +103,12 @@ elif gparams["model"] == "DarcyGNN":
     model_FEONet = MODEL(hidden_dim=hidden_dims, num_layers=num_layers, edge_dim=6)
 elif gparams["model"] == "GraphtoVec":
     conv_dims = [3] + [32, 64, 128, 256]
-    mlp_dims = [256, 128, 64] + [49]
+    mlp_dims = [256,128,64] + [49]
     model_FEONet = MODEL(conv_dims=conv_dims, mlp_dims=mlp_dims, dropout=0.1)
     
 device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
 model_FEONet = model_FEONet.to(device)
+P_h = torch.tensor(P_h, dtype=torch.float32).to(device)
     
 
 # KAIMING INITIALIZATION
@@ -150,16 +151,22 @@ class DarcyGraphDataset(InMemoryDataset):
         # Shared graph structure
         edge_index = torch.tensor(arr["edges"], dtype=torch.long)
         pos = torch.tensor(arr["coarse_nodes"], dtype=torch.float)
+        print("pos.shape:", pos.shape)
+        
 
         # Extract split
-        A_all = arr[f"{self.kind}_matrices"]
-        a_all = arr[f"{self.kind}_coeffs_a"]
-        u_all = arr[f"{self.kind}_u"]
-        f_all = arr[f"{self.kind}_load_vectors"]
+        A_all = arr[f"{self.kind}_matrices"][:10]
+        a_all = arr[f"{self.kind}_coeffs_a"][:10]
+        u_all = arr[f"{self.kind}_u"][:10]
+        f_all = arr[f"{self.kind}_load_vectors"][:10]
+        Q_all = arr[f"{self.kind}_Q"][:10]
+        u_fine_all = arr[f"{self.kind}_u_h_fine"][:10]
         print("A_all.shape:", A_all.shape)
         print("a_all.shape:", a_all.shape)
         print("u_all.shape:", u_all.shape)
         print("f_all.shape:", f_all.shape)
+        print("Q_all.shape:", Q_all.shape)
+        print("u_fine_all.shape:", u_fine_all.shape)
 
         N = a_all.shape[0]
         print(N)
@@ -171,6 +178,8 @@ class DarcyGraphDataset(InMemoryDataset):
         for k in range(N):
             A_matrix = torch.tensor(A_all[k], dtype=torch.float)
             f = torch.tensor(f_all[k], dtype=torch.float)
+            Q_h = torch.tensor(Q_all[k], dtype=torch.float)
+            u_h_fine = torch.tensor(u_fine_all[k], dtype=torch.float)
 
             x = torch.tensor(a_all[k], dtype=torch.float).unsqueeze(-1)
             y = torch.tensor(u_all[k], dtype=torch.float).unsqueeze(-1)
@@ -183,7 +192,7 @@ class DarcyGraphDataset(InMemoryDataset):
             a_i = x[i]            
             a_j = x[j]            
             
-            A_ij = A_matrix[i, j].unsqueeze(-1)
+            #A_ij = A_matrix[i, j].unsqueeze(-1)
 
             # Edge features
             edge_attr = torch.cat(
@@ -200,7 +209,9 @@ class DarcyGraphDataset(InMemoryDataset):
                 y=y,
                 pos=pos,
                 A=A_matrix,      
-                f=f       
+                f=f,
+                Q_h=Q_h,
+                u_fine=u_h_fine   
             )
             data_list.append(data)
 
@@ -241,7 +252,7 @@ class NewDarcyGraphDataset(InMemoryDataset):
         # Shared graph structure
         # -------------------------------------------------
         edge_index = torch.tensor(arr["edges"], dtype=torch.long)  
-        fine_nodes = torch.tensor(arr["fine_nodes"], dtype=torch.float)
+        fine_nodes = torch.tensor(arr["coarse_nodes"], dtype=torch.float)
 
         # -------------------------------------------------
         # Split-specific data
@@ -332,6 +343,7 @@ def init_optim_adagrad(model, lr=1e-2, weight_decay=0):
     }
     return torch.optim.Adagrad(model.parameters(), **params)
 
+
 if gparams['optimizer'] == "LBFGS":
     optimizer = init_optim_lbfgs(model_FEONet)
 elif gparams['optimizer'] == "Adam":
@@ -344,46 +356,11 @@ elif gparams['optimizer'] == "Adagrad":
     optimizer = init_optim_adagrad(model_FEONet)
 
 
-def rel_L2_error(u_pred, u_true):
-    return torch.norm(u_pred - u_true) / torch.norm(u_true)
+optimizer = init_optim_adam(model_FEONet, lr=1e-3)
+lbfgs_optimizer = init_optim_lbfgs(model_FEONet)
 
-def rel_l2_loss(u_pred, u_true, eps=1e-8):
-    diff = torch.norm(u_pred - u_true, dim=1)
-    denom = torch.norm(u_true, dim=1) + eps
-    return torch.mean(diff / denom)
+switch_epoch = 1000
 
-"""
-def compute_loss(u_pred, batch, loss_type="rel_l2"):
-    ptr = batch.ptr
-    batch_size = ptr.numel() - 1
-    num_nodes = ptr[1] - ptr[0]
-
-    u_pred = u_pred.view(batch_size, num_nodes)
-    u_true = batch.y.view(batch_size, num_nodes)
-
-    if loss_type == "mse":
-        return torch.mean((u_pred - u_true) ** 2)
-
-    elif loss_type == "rel_l2":
-        diff = u_pred - u_true
-        return torch.mean(
-            torch.norm(diff, dim=1) /
-            (torch.norm(u_true, dim=1) + 1e-8)
-        )
-
-    elif loss_type == "weak_form":
-        A = batch.A.view(batch_size, num_nodes, num_nodes)   # (B, N, N)
-        f = batch.f.view(batch_size, num_nodes)              # (B, N)
-
-        r = torch.bmm(A, u_pred.unsqueeze(-1)).squeeze(-1) - f  # (B, N)
-
-        return torch.mean(
-            torch.norm(r, dim=1) /
-            (torch.norm(f, dim=1) + 1e-8)
-        )
-    else:
-        raise ValueError(f"Unknown loss_type: {loss_type}")
-"""
     
 def compute_loss(u_pred, batch, loss_type="mse", eps=1e-8):
     """
@@ -408,14 +385,40 @@ def compute_loss(u_pred, batch, loss_type="mse", eps=1e-8):
 
     elif loss_type == "weak_form":
         # Residual: A u - f
+        print("batch.A.shape: ", batch.A.shape)
+        print("batch.Q.shape: ", batch.Q_h.shape)
+        print("batch.u_h_fine.shape: ", batch.u_fine.shape)
+        print("u_pred.shape: ", u_pred.shape)
         r = torch.bmm(batch.A, u_pred.unsqueeze(-1)).squeeze(-1) - batch.f
         return torch.mean(torch.norm(r, dim=1))
+    
+    elif loss_type == "total":
+        ptr = batch.ptr
+        B = ptr.numel() - 1
+        Nc = ptr[1] - ptr[0]           # 81
+        Nf = batch.u_fine.numel() // B # 16641
+
+        Q_h = batch.Q_h.view(B, Nc, Nf)
+        u_pred = u_pred.view(B, Nc, 1)
+        u_fine = batch.u_fine.view(B, Nf)
+
+
+        # P_h: (81, 16641) -> (1, 81, 16641)
+        P_h_batched = P_h.unsqueeze(0)
+
+        M = P_h_batched + Q_h           # (B, 81, 16641)
+        M_T = M.transpose(1, 2)         # (B, 16641, 81)
+
+        recon = torch.bmm(M_T, u_pred).squeeze(-1)  # (B, 16641)
+
+        return torch.norm(recon - u_fine, dim=1).mean()
+
 
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
 
 
-def closure(model, batch, loss_type="mse"):
+def closure(model, batch, loss_type):
     u_pred = model(batch)
     loss = compute_loss(u_pred, batch, loss_type)
     return loss, u_pred
@@ -443,6 +446,43 @@ if not os.path.exists(log_file):
         f.write("=" * 60 + "\n")
         f.write(f"Optimizer:\n{str(optimizer)}\n")
         f.write("=" * 60 + "\n")
+        
+def rel_L2_error_fine(u_pred, batch, P_h, eps=1e-8):
+    """
+    u_pred      : (B*Nc, 1) or (B*Nc,)
+    batch.Q_h   : (B*Nc, Nf)
+    batch.u_fine: (B*Nf,)
+    P_h         : (Nc, Nf)
+    """
+
+    ptr = batch.ptr
+    B = ptr.numel() - 1
+    Nc = ptr[1] - ptr[0]
+    Nf = batch.u_fine.numel() // B
+
+    # ---------------------------------
+    # Reshape PyG-smushed tensors
+    # ---------------------------------
+    Q_h = batch.Q_h.view(B, Nc, Nf)
+    u_pred = u_pred.view(B, Nc, 1)
+    u_fine = batch.u_fine.view(B, Nf)
+
+
+    P_h_batched = P_h.unsqueeze(0)
+
+    M = P_h_batched + Q_h           # (B, Nc, Nf)
+    M_T = M.transpose(1, 2)         # (B, Nf, Nc)
+
+    u_fine_pred = torch.bmm(M_T, u_pred).squeeze(-1)  # (B, Nf)
+
+    # ---------------------------------
+    # Relative L2 per graph
+    # ---------------------------------
+    num = torch.norm(u_fine_pred - u_fine, dim=1)
+    denom = torch.norm(u_fine, dim=1) + eps
+
+    return torch.mean(num / denom)
+
 
 print("#########################")
 print("Start training GNN")
@@ -482,20 +522,39 @@ for epoch in range(1, epochs + 1):
     # =======================
     # Validation
     # =======================
-    if epoch % 2 == 0:
+    if epoch % 10 == 0:
         model_FEONet.eval()
         rel_err_total = 0.0
-        count = 0
+        rel_err_train = 0.0
+        count_train = 0
+        count_val = 0
+        
+        with torch.no_grad():
+            for batch in train_loader:
+                batch = batch.to(device)
+                pred = model_FEONet(batch)
+
+                rel_err_train += rel_L2_error_fine(
+                    pred, batch, P_h
+                ).item()
+
+                count_train += 1
+                
+        rel_err_train = rel_err_train / count_train
+        print("rel err train: ", rel_err_train)
 
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(device)
                 pred = model_FEONet(batch)
 
-                rel_err_total += rel_L2_error(pred, batch.y).item()
-                count += 1
+                rel_err_total += rel_L2_error_fine(
+                    pred, batch, P_h
+                ).item()
 
-        rel_err = rel_err_total / count
+                count_val += 1
+
+        rel_err = rel_err_total / count_val
         loss_history.append(epoch_loss)
         test_history.append(rel_err)
 
@@ -513,6 +572,7 @@ for epoch in range(1, epochs + 1):
 checkpoint = {
     "model_state_dict": model_FEONet.state_dict(),
     "args": gparams,
+    "final_phase": "weak_form" if epochs > switch_epoch else "mse",
 }
 
 save_path = os.path.join(path, f"{gparams['model']}_MSE_to_WEAK.pt")
