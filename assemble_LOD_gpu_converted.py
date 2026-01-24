@@ -32,9 +32,11 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 parser = argparse.ArgumentParser("SEM")
 parser.add_argument("--type", type=str, choices=['quantile', 'lognormal', 'coarse_checkerboard', 'fine_checkerboard', 'horizontal', 'vertical'])
-parser.add_argument("--H", type=int, default=3)
+parser.add_argument("--H", type=int, default=4)
 parser.add_argument("--h", type=int, default=7)
-parser.add_argument("--k", type=int, default=5)
+parser.add_argument("--k", type=int, default=10)
+parser.add_argument("--num_training_samples", type=int, default=500)
+parser.add_argument("--num_validation_samples", type=int, default=100)
 args = parser.parse_args()
 gparams = args.__dict__
 
@@ -42,6 +44,8 @@ TYPE = gparams["type"]
 H = 2**(-gparams["H"])
 h = 2**(-gparams["h"])
 k = gparams["k"]
+num_train = gparams["num_training_samples"]
+num_val = gparams["num_validation_samples"]
 
 
 class SEGaussianSamplerSVD:
@@ -369,7 +373,7 @@ def create_dataset(num_input, H, h, kappa_values):
                 return K[j, i]
 
             # --- sample on coarse nodes ---
-            a_sample = np.array([kappa(p[0], p[1]) for p in coarse_nodes])
+            a_sample = np.array([kappa(p[0], p[1]) for p in fine_nodes])
             train_coeffs_a.append(a_sample)
 
             A_LOD_matrix, f_LOD_vector, Q_h, u_h_fine = make_LOD_data(
@@ -502,7 +506,7 @@ def create_dataset(num_input, H, h, kappa_values):
                 return K[j, i]
 
             # --- sample on coarse nodes ---
-            a_sample = np.array([kappa(p[0], p[1]) for p in coarse_nodes])
+            a_sample = np.array([kappa(p[0], p[1]) for p in fine_nodes])
             validate_coeffs_a.append(a_sample)
 
             A_LOD_matrix, f_LOD_vector, Q_h, u_h_fine = make_LOD_data(
@@ -550,7 +554,7 @@ def create_dataset(num_input, H, h, kappa_values):
 
 order='1'
 list_num_xy=[129]
-num_input=[1, 1]
+num_input=[num_train, num_val]
 typ='Darcy'
 
 epsi = 0.01
