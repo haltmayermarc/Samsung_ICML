@@ -46,6 +46,11 @@ h = 2**(-gparams["h"])
 k = gparams["k"]
 num_train = gparams["num_training_samples"]
 num_val = gparams["num_validation_samples"]
+print(H)
+print(h)
+print(k)
+print(num_train)
+print(num_val)
 
 
 class SEGaussianSamplerSVD:
@@ -114,8 +119,11 @@ def make_lognormal_kappa(
     def kappa_func(x, y):
         x = np.atleast_1d(x)
         y = np.atleast_1d(y)
-        pts = np.column_stack([x, y])
-        return interpolator(pts)
+        vals = interpolator(np.column_stack([x, y]))
+
+        if vals.size == 1:
+            return float(vals[0])   # ← force scalar
+        return vals
 
     return kappa_func, A
 
@@ -205,13 +213,9 @@ def create_dataset(num_input, H, h, kappa_values):
     pos = fine_nodes
     print("Meshing finished...")
     
-    # GRF parameters
-    sigma = 1.0     # variance
-    ell = 0.3       # correlation length
-    
     # Construct SE Kernel sampler for GRF
     if TYPE == "quantile":
-        sampler = SEGaussianSamplerSVD(pos, sigma=sigma, ell=ell, mean=1.0, tol=1e-8)
+        sampler = SEGaussianSamplerSVD(pos, sigma=1.0, ell=0.3, mean=1.0, tol=1e-8)
     elif TYPE == "lognormal":
         field = MaternGaussianField(
                 fine_nodes,

@@ -406,7 +406,7 @@ def compute_single_element_matrices(t, elem, fine_nodes, kappa_func):
     return t, A_t, M_t
 
 
-def build_fine_element_matrices(grid, kappa_func, n_jobs=-1, show_tqdm=True, backend="threading"):
+def build_fine_element_matrices(grid, kappa_func, n_jobs=-1, show_tqdm=True, backend="loky"):
     fine_nodes = grid["fine_nodes"]
     fine_elems = grid["fine_elems"]
     num_elems  = fine_elems.shape[0]
@@ -799,7 +799,7 @@ def process_single_element_fast(
 
 def computeCorrections(
     mesh, k, adjacency, fine_in_coarse, A_h, B_H, C_h, kappa_func,
-    n_jobs=-1, show_tqdm=True, backend="threading",
+    n_jobs=-1, show_tqdm=True, backend="loky",
     patch_solver: str = "auto", symmetrize_for_cholmod: bool = True
 ):
     """
