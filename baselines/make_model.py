@@ -107,7 +107,7 @@ class DarcyInputPreprocess(nn.Module):
         coeff_preproc: str = 'log',
         add_grad: bool = True,
         add_coords: bool = True,
-        eps: float = 1e-12,
+        eps: float = 1e-6,
         default_hw: Tuple[int, int] = (129, 129),
     ):
         super().__init__()
@@ -170,6 +170,14 @@ class DarcyInputPreprocess(nn.Module):
 # =====================================================================
 
 
+def _make_bc_mask(H: int, W: int) -> torch.Tensor:
+    mask = torch.ones((1, H, W), dtype=torch.float32)  # (1,H,W)
+    mask[:, 0, :] = 0
+    mask[:, -1, :] = 0
+    mask[:, :, 0] = 0
+    mask[:, :, -1] = 0
+    return mask
+
 class DarcyCoeffModel(nn.Module):
     """A self-contained Darcy coefficient predictor.
 
@@ -211,8 +219,9 @@ class DarcyCoeffModel(nn.Module):
             self.u_norm = MatrixNorm(H=default_hw[0], W=default_hw[1], mean=u_mean, std=u_std)
         else:
             self.u_norm = Identity()
-
         print('u_normalization:', u_normalization)
+
+        self.register_buffer("bc_mask", _make_bc_mask(default_hw[0], default_hw[1]))  # (1,H,W)
         self.core = core
 
     @property
@@ -221,11 +230,8 @@ class DarcyCoeffModel(nn.Module):
 
     # ---- output helpers ----
     def apply_constraint(self, u: torch.Tensor) -> torch.Tensor:
-        u[:, 0] = 0.0
-        u[:, -1] = 0.0
-        u[0, :] = 0.0
-        u[-1, :] = 0.0
-        return u
+        # u: (B,H,W)
+        return u * self.bc_mask  # broadcast -> (B,H,W)
     
     def encode_u(self, u_phys: torch.Tensor) -> torch.Tensor:
         return self.apply_constraint(self.u_norm.encode(u_phys))
@@ -243,6 +249,55 @@ class DarcyCoeffModel(nn.Module):
         # Default forward returns physical coefficients (decoded)
         u_hat_norm = self.forward_norm(a_raw)
         return self.decode_u(u_hat_norm)
+
+
+
+class AutoIOWrapper(nn.Module):
+    """
+    core가 NCHW를 못 받으면 NHWC로 시도.
+    출력도 (B,1,H,W)로 통일해줌.
+    """
+    def __init__(self, core: nn.Module, H: int, W: int, Cin: int, device='cpu'):
+        super().__init__()
+        self.core = core
+        self.mode = None  # 'nchw' or 'nhwc'
+        self.H, self.W, self.Cin = H, W, Cin
+
+        x = torch.zeros(2, Cin, H, W, device=device)
+
+        # try NCHW
+        try:
+            y = self.core(x)
+            self.mode = 'nchw'
+            return
+        except Exception:
+            pass
+
+        # try NHWC
+        try:
+            y = self.core(x.permute(0, 2, 3, 1))  # (B,H,W,C)
+            self.mode = 'nhwc'
+            return
+        except Exception as e:
+            raise RuntimeError(f"core does not accept NCHW or NHWC. Last error: {e}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mode == 'nchw':
+            y = self.core(x)
+        else:
+            y = self.core(x.permute(0, 2, 3, 1))
+
+        # y를 (B,1,H,W)로 통일
+        if y.dim() == 4:
+            # (B,1,H,W) or (B,H,W,1)
+            if y.shape[1] == 1:
+                return y
+            if y.shape[-1] == 1:
+                return y.permute(0, 3, 1, 2)  # -> (B,1,H,W)
+        elif y.dim() == 3:
+            # (B,H,W)
+            return y.unsqueeze(1)
+        raise RuntimeError(f"Unexpected core output shape: {tuple(y.shape)}")
 
 
 def build_darcy_model(
@@ -301,7 +356,7 @@ def build_darcy_model(
             uno_n_modes=[[16,16], [12,12], [12,12], [12,12], [16,16]],
             uno_scalings=[[1,1], [0.5,0.5], [1,1], [2,2], [1,1]],
             hidden_channels=64,
-            in_channels=1,
+            in_channels=Cin,
             out_channels=1,
             channel_mlp_skip='linear'
         )
@@ -316,7 +371,7 @@ def build_darcy_model(
             rank=0.05
         )
         core = MGTFNO(
-            in_channels=1,
+            in_channels=Cin,
             out_channels=1,
             levels=num_levels,
             kwargs=tfno_kwargs
@@ -344,6 +399,9 @@ def build_darcy_model(
         )
     else:
         raise ValueError(f"Unknown model: {model_name}")
+    
+    H, W = default_hw
+    core = AutoIOWrapper(core, H=H, W=W, Cin=Cin, device='cpu')
 
     return DarcyCoeffModel(
         core=core,
