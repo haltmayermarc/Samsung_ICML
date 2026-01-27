@@ -171,7 +171,7 @@ model = build_darcy_model(
     x_std=x_std,
     u_mean=u_mean,
     u_std=u_std,
-    default_hw=(fixed["train_coeffs_a"].shape[1], fixed["train_coeffs_a"].shape[2]),
+    default_hw=(129, 129),
 )
 model = model.to(device)
 
