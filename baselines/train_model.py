@@ -18,7 +18,7 @@ from make_model import *
 parser = argparse.ArgumentParser("Train Darcy")
 parser.add_argument("--type", type=str, choices=['quantile', 'lognormal', 'lognormal2', 'fine_checkerboard'])
 parser.add_argument("--basis_order", type=str, choices=['1', '2'], default=1)
-parser.add_argument("--num_training_data", type=int, default=500)
+parser.add_argument("--num_training_data", type=int, default=1000)
 
 parser.add_argument("--model", type=str, choices=["fno", "uno", "cno", 'mg_tfno', 'deeponet', 'transolver'], default="fno")
 parser.add_argument("--optimizer", type=str, default="Adam")
@@ -29,9 +29,9 @@ parser.add_argument("--epochs", type=int, default=2000)
 parser.add_argument("--gpu", type=int, default=0)
 
 parser.add_argument("--coeff_preproc", type=str, choices=['raw', 'log'], default='log')
-parser.add_argument("--u_normalization", action=argparse.BooleanOptionalAction, default=False)
-parser.add_argument("--add_grad", action=argparse.BooleanOptionalAction, default=False)
-parser.add_argument("--add_coords", action=argparse.BooleanOptionalAction, default=False)
+parser.add_argument("--normalization", action=argparse.BooleanOptionalAction, default=True)
+parser.add_argument("--add_grad", action=argparse.BooleanOptionalAction, default=True)
+parser.add_argument("--add_coords", action=argparse.BooleanOptionalAction, default=True)
 
 
 def set_seed(seed: int):
@@ -164,7 +164,7 @@ val_loader = DataLoader(val_dataset, batch_size=validate_batch_size, shuffle=Fal
 model = build_darcy_model(
     model_name=gparams["model"],
     coeff_preproc=gparams['coeff_preproc'],
-    u_normalization=gparams['u_normalization'],
+    normalization=gparams['normalization'],
     add_grad=gparams['add_grad'],
     add_coords=gparams['add_coords'],
     x_mean=x_mean,

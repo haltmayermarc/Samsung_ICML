@@ -194,7 +194,7 @@ class DarcyCoeffModel(nn.Module):
         self,
         core: nn.Module,
         coeff_preproc: str = 'log',
-        u_normalization: bool = True,
+        normalization: bool = True,
         add_grad: bool = True,
         add_coords: bool = True,
         x_mean: Optional[torch.Tensor] = None,
@@ -212,14 +212,13 @@ class DarcyCoeffModel(nn.Module):
         )
 
         Cin = self.pre.Cin
-        # Normalize preprocessed input
-        self.x_norm = ChannelwiseNorm2D(C=Cin, mean=x_mean, std=x_std)
-        # Normalize output coeffs
-        if u_normalization:
+        if normalization:
+            self.x_norm = ChannelwiseNorm2D(C=Cin, mean=x_mean, std=x_std)
             self.u_norm = MatrixNorm(H=default_hw[0], W=default_hw[1], mean=u_mean, std=u_std)
         else:
+            self.x_norm = Identity()
             self.u_norm = Identity()
-        print('u_normalization:', u_normalization)
+        print('normalization:', normalization)
 
         self.register_buffer("bc_mask", _make_bc_mask(default_hw[0], default_hw[1]))  # (1,H,W)
         self.core = core
@@ -303,7 +302,7 @@ class AutoIOWrapper(nn.Module):
 def build_darcy_model(
     model_name: str,
     coeff_preproc: str,
-    u_normalization: bool,
+    normalization: bool,
     add_grad: bool,
     add_coords: bool,
     x_mean: torch.Tensor,
@@ -406,7 +405,7 @@ def build_darcy_model(
     return DarcyCoeffModel(
         core=core,
         coeff_preproc=coeff_preproc,
-        u_normalization=u_normalization,
+        normalization=normalization,
         add_grad=add_grad,
         add_coords=add_coords,
         x_mean=x_mean,
