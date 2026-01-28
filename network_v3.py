@@ -258,6 +258,18 @@ class VectorNorm(nn.Module):
     def decode(self, y: torch.Tensor) -> torch.Tensor:
         return y * (self.std + self.eps) + self.mean
 
+class Identity(nn.Module):
+    """Per-component normalization for (B,D) vectors."""
+
+    def __init__(self):
+        super().__init__()
+
+    def encode(self, y: torch.Tensor) -> torch.Tensor:
+        return y
+
+    def decode(self, y: torch.Tensor) -> torch.Tensor:
+        return y
+
 
 class DarcyInputPreprocess(nn.Module):
     """Make CNN input channels from a raw Darcy coefficient field.
@@ -352,6 +364,7 @@ class DarcyCoeffModel(nn.Module):
         self,
         core: nn.Module,
         coeff_preproc: str = 'log',
+        normalization: bool = True,
         add_grad: bool = True,
         add_coords: bool = True,
         x_mean: Optional[torch.Tensor] = None,
@@ -369,10 +382,16 @@ class DarcyCoeffModel(nn.Module):
         )
 
         Cin = self.pre.Cin
-        # Normalize preprocessed input
-        self.x_norm = ChannelwiseNorm2D(C=Cin, mean=x_mean, std=x_std)
-        # Normalize output coeffs
-        self.u_norm = VectorNorm(D=49, mean=u_mean, std=u_std)
+        if normalization:
+            # Normalize preprocessed input
+            self.x_norm = ChannelwiseNorm2D(C=Cin, mean=x_mean, std=x_std)
+            # Normalize output coeffs
+            self.u_norm = VectorNorm(D=49, mean=u_mean, std=u_std)
+        else:
+            self.x_norm = Identity()
+            self.u_norm = Identity()
+        print('normalization:', normalization)
+
         self.core = core
 
     @property
@@ -401,6 +420,7 @@ class DarcyCoeffModel(nn.Module):
 def build_darcy_coeff_model(
     model_name: str,
     coeff_preproc: str,
+    normalization: bool,
     add_grad: bool,
     add_coords: bool,
     x_mean: torch.Tensor,
@@ -423,6 +443,8 @@ def build_darcy_coeff_model(
     pre = DarcyInputPreprocess(coeff_preproc=coeff_preproc, add_grad=add_grad, add_coords=add_coords, default_hw=default_hw)
     Cin = pre.Cin
 
+    print("Cin:", Cin)
+
     if model_name == 'LODMimetic':
         core = LODMimeticNet(in_ch=Cin, **core_kwargs)
     elif model_name == 'FNOCoarse':
@@ -433,6 +455,7 @@ def build_darcy_coeff_model(
     return DarcyCoeffModel(
         core=core,
         coeff_preproc=coeff_preproc,
+        normalization=normalization,
         add_grad=add_grad,
         add_coords=add_coords,
         x_mean=x_mean,

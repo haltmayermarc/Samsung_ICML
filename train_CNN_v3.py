@@ -14,7 +14,7 @@ from network_v3 import *
 # ARGS (kept compatible with train_CNN_v2)
 parser = argparse.ArgumentParser("SEM")
 ## Data
-parser.add_argument("--type", type=str, choices=['quantile', 'lognormal1', 'lognormal2', 'coarse_checkerboard', 'fine_checkerboard', 'horizontal', 'vertical'])
+parser.add_argument("--type", type=str, choices=['quantile', 'lognormal', 'lognormal2', 'fine_checkerboard'])
 parser.add_argument("--basis_order", type=str, choices=['1', '2'], default=1)
 parser.add_argument("--num_training_data", type=int, default=500)
 
@@ -29,10 +29,9 @@ parser.add_argument("--gpu", type=int, default=0)
 
 ## Input preprocessing
 parser.add_argument("--coeff_preproc", type=str, choices=['raw', 'log'], default='log')
-parser.add_argument("--add_grad", action='store_true', default=True)
-parser.add_argument("--no_add_grad", action='store_false', dest='add_grad')
-parser.add_argument("--add_coords", action='store_true', default=True)
-parser.add_argument("--no_add_coords", action='store_false', dest='add_coords')
+parser.add_argument("--normalization", action=argparse.BooleanOptionalAction, default=True)
+parser.add_argument("--add_grad", action=argparse.BooleanOptionalAction, default=True)
+parser.add_argument("--add_coords", action=argparse.BooleanOptionalAction, default=True)
 
 ## Optional: keep legacy 2-phase (MSE -> WEAK) behavior
 parser.add_argument("--mse_to_weak", action='store_true', default=False)
@@ -79,9 +78,11 @@ def compute_stats_with_preprocessor(fixed_npz, chunk_size: int = 64):
     (DarcyInputPreprocess) to avoid any mismatch.
     """
 
-    a_all = fixed_npz["train_coeffs_a"].astype(np.float32)  # (N,H,W)
-    u_all = fixed_npz["train_u"].astype(np.float32)  # (N,225)
+    a_all = fixed_npz["train_coeffs_a"].reshape(-1, 129, 129).astype(np.float32)  # (N,H,W)
+    u_all = fixed_npz["train_u"](-1, 129, 129).astype(np.float32)  # (N,225)
 
+    print('add_grad:', gparams['add_grad'])
+    print('add_coords:', gparams['add_coords'])
     pre = DarcyInputPreprocess(
         coeff_preproc=gparams['coeff_preproc'],
         add_grad=gparams['add_grad'],
@@ -164,13 +165,14 @@ val_loader = DataLoader(val_dataset, batch_size=validate_batch_size, shuffle=Fal
 model_FEONet = build_darcy_coeff_model(
     model_name=gparams["model"],
     coeff_preproc=gparams['coeff_preproc'],
+    normalization=gparams['normalization'],
     add_grad=gparams['add_grad'],
     add_coords=gparams['add_coords'],
     x_mean=x_mean,
     x_std=x_std,
     u_mean=u_mean,
     u_std=u_std,
-    default_hw=(fixed["train_coeffs_a"].shape[1], fixed["train_coeffs_a"].shape[2]),
+    default_hw=(129, 129),
 )
 model_FEONet = model_FEONet.to(device)
 model_FEONet.apply(weights_init)
@@ -288,6 +290,8 @@ if not os.path.exists(log_file):
         f.write(f"Model Architecture:\n{str(model_FEONet)}\n")
         f.write("=" * 60 + "\n")
         f.write(f"Optimizer:\n{str(optimizer)}\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"gparams:\n{gparams}\n")
         f.write("=" * 60 + "\n")
         
 def rel_L2_error_fine(u_pred, batch, P_h, interior_idx, eps=1e-10):
