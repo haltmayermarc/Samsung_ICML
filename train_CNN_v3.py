@@ -79,7 +79,7 @@ def compute_stats_with_preprocessor(fixed_npz, chunk_size: int = 64):
     """
 
     a_all = fixed_npz["train_coeffs_a"].reshape(-1, 129, 129).astype(np.float32)  # (N,H,W)
-    u_all = fixed_npz["train_u"](-1, 129, 129).astype(np.float32)  # (N,225)
+    u_all = fixed_npz["train_u"].reshape(-1, 225).astype(np.float32)  # (N,225)
 
     print('add_grad:', gparams['add_grad'])
     print('add_coords:', gparams['add_coords'])
